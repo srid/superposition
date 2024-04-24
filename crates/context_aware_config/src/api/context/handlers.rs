@@ -1,7 +1,9 @@
 extern crate base64;
 use std::str;
 
-use crate::helpers::{json_to_sorted_string, validate_context_jsonschema};
+use crate::helpers::{
+    add_config_version, json_to_sorted_string, validate_context_jsonschema,
+};
 use crate::{
     api::{
         context::types::{
@@ -18,6 +20,9 @@ use crate::{
         },
     },
 };
+use actix_web::web::Data;
+use service_utils::service::types::AppState;
+
 use actix_web::{
     delete, get, put,
     web::{Json, Path, Query},
@@ -247,25 +252,23 @@ fn get_put_resp(ctx: Context) -> PutResp {
 
 fn put(
     req: Json<PutReq>,
-    conn: &mut PooledConnection<ConnectionManager<PgConnection>>,
-    already_under_txn: bool,
+    transaction_conn: &mut PooledConnection<ConnectionManager<PgConnection>>,
     user: &User,
 ) -> superposition::Result<PutResp> {
     use contexts::dsl::contexts;
-    let new_ctx = create_ctx_from_put_req(req, conn, user)?;
+    let new_ctx = create_ctx_from_put_req(req, transaction_conn, user)?;
 
-    if already_under_txn {
-        diesel::sql_query("SAVEPOINT put_ctx_savepoint").execute(conn)?;
-    }
-    let insert = diesel::insert_into(contexts).values(&new_ctx).execute(conn);
+    diesel::sql_query("SAVEPOINT put_ctx_savepoint").execute(transaction_conn)?;
+    let insert = diesel::insert_into(contexts)
+        .values(&new_ctx)
+        .execute(transaction_conn);
 
     match insert {
         Ok(_) => Ok(get_put_resp(new_ctx)),
         Err(DatabaseError(UniqueViolation, _)) => {
-            if already_under_txn {
-                diesel::sql_query("ROLLBACK TO put_ctx_savepoint").execute(conn)?;
-            }
-            update_override_of_existing_ctx(conn, new_ctx)
+            diesel::sql_query("ROLLBACK TO put_ctx_savepoint")
+                .execute(transaction_conn)?;
+            update_override_of_existing_ctx(transaction_conn, new_ctx)
         }
         Err(e) => {
             log::error!("failed to update context with db error: {:?}", e);
@@ -276,30 +279,36 @@ fn put(
 
 #[put("")]
 async fn put_handler(
+    state: Data<AppState>,
     req: Json<PutReq>,
     mut db_conn: DbConnection,
     user: User,
 ) -> superposition::Result<Json<PutResp>> {
-    put(req, &mut db_conn, false, &user)
-        .map(|resp| Json(resp))
-        .map_err(|err: superposition::AppError| {
-            log::info!("context put failed with error: {:?}", err);
-            err
-        })
+    let mut snowflake_generator = state.snowflake_generator.lock().unwrap();
+    let version_id = snowflake_generator.real_time_generate();
+    db_conn.transaction::<_, superposition::AppError, _>(|transaction_conn| {
+        let put_response = put(req, transaction_conn, &user)
+            .map(|resp| Json(resp))
+            .map_err(|err: superposition::AppError| {
+                log::info!("context put failed with error: {:?}", err);
+                err
+            })?;
+        add_config_version(version_id, transaction_conn)?;
+        Ok(put_response)
+    })
 }
 
 fn r#move(
     old_ctx_id: String,
     req: Json<MoveReq>,
-    conn: &mut PooledConnection<ConnectionManager<PgConnection>>,
-    already_under_txn: bool,
+    transaction_conn: &mut PooledConnection<ConnectionManager<PgConnection>>,
     user: &User,
 ) -> superposition::Result<PutResp> {
     use contexts::dsl;
     let req = req.into_inner();
     let ctx_condition = Value::Object(req.context);
     let new_ctx_id = hash(&ctx_condition);
-    let dimension_schema_map = get_all_dimension_schema_map(conn)?;
+    let dimension_schema_map = get_all_dimension_schema_map(transaction_conn)?;
     let priority = validate_dimensions_and_calculate_priority(
         "context",
         &ctx_condition,
@@ -310,9 +319,7 @@ fn r#move(
         return Err(bad_argument!("no dimension found in context"));
     }
 
-    if already_under_txn {
-        diesel::sql_query("SAVEPOINT update_ctx_savepoint").execute(conn)?;
-    }
+    diesel::sql_query("SAVEPOINT update_ctx_savepoint").execute(transaction_conn)?;
 
     let context = diesel::update(dsl::contexts)
         .filter(dsl::id.eq(&old_ctx_id))
@@ -321,7 +328,7 @@ fn r#move(
             dsl::value.eq(&ctx_condition),
             dsl::priority.eq(priority),
         ))
-        .get_result(conn);
+        .get_result(transaction_conn);
 
     let contruct_new_ctx_with_old_overrides = |ctx: Context| Context {
         id: new_ctx_id,
@@ -333,33 +340,21 @@ fn r#move(
         override_: ctx.override_,
     };
 
-    let handle_unique_violation =
-        |db_conn: &mut DBConnection, already_under_txn: bool| {
-            if already_under_txn {
-                let deleted_ctxt = diesel::delete(dsl::contexts)
-                    .filter(dsl::id.eq(&old_ctx_id))
-                    .get_result(db_conn)?;
+    let handle_unique_violation = |db_conn: &mut DBConnection| {
+        let deleted_ctxt = diesel::delete(dsl::contexts)
+            .filter(dsl::id.eq(&old_ctx_id))
+            .get_result(db_conn)?;
 
-                let ctx = contruct_new_ctx_with_old_overrides(deleted_ctxt);
-                update_override_of_existing_ctx(db_conn, ctx)
-            } else {
-                db_conn.build_transaction().read_write().run(|conn| {
-                    let deleted_ctxt = diesel::delete(dsl::contexts)
-                        .filter(dsl::id.eq(&old_ctx_id))
-                        .get_result(conn)?;
-                    let ctx = contruct_new_ctx_with_old_overrides(deleted_ctxt);
-                    update_override_of_existing_ctx(conn, ctx)
-                })
-            }
-        };
+        let ctx = contruct_new_ctx_with_old_overrides(deleted_ctxt);
+        update_override_of_existing_ctx(db_conn, ctx)
+    };
 
     match context {
         Ok(ctx) => Ok(get_put_resp(ctx)),
         Err(DatabaseError(UniqueViolation, _)) => {
-            if already_under_txn {
-                diesel::sql_query("ROLLBACK TO update_ctx_savepoint").execute(conn)?;
-            }
-            handle_unique_violation(conn, already_under_txn)
+            diesel::sql_query("ROLLBACK TO update_ctx_savepoint")
+                .execute(transaction_conn)?;
+            handle_unique_violation(transaction_conn)
         }
         Err(e) => {
             log::error!("failed to move context with db error: {:?}", e);
@@ -370,17 +365,24 @@ fn r#move(
 
 #[put("/move/{ctx_id}")]
 async fn move_handler(
+    state: Data<AppState>,
     path: Path<String>,
     req: Json<MoveReq>,
     mut db_conn: DbConnection,
     user: User,
 ) -> superposition::Result<Json<PutResp>> {
-    r#move(path.into_inner(), req, &mut db_conn, false, &user)
-        .map(|resp| Json(resp))
-        .map_err(|err| {
-            log::info!("move api failed with error: {:?}", err);
-            err
-        })
+    let mut snowflake_generator = state.snowflake_generator.lock().unwrap();
+    let version_id = snowflake_generator.real_time_generate();
+    db_conn.transaction::<_, superposition::AppError, _>(|transaction_conn| {
+        let move_reponse = r#move(path.into_inner(), req, transaction_conn, &user)
+            .map(|resp| Json(resp))
+            .map_err(|err| {
+                log::info!("move api failed with error: {:?}", err);
+                err
+            })?;
+        add_config_version(version_id, transaction_conn)?;
+        Ok(move_reponse)
+    })
 }
 
 #[get("/{ctx_id}")]
@@ -434,6 +436,7 @@ async fn list_contexts(
 
 #[delete("/{ctx_id}")]
 async fn delete_context(
+    state: Data<AppState>,
     path: Path<String>,
     db_conn: DbConnection,
     user: User,
@@ -442,37 +445,45 @@ async fn delete_context(
     let DbConnection(mut conn) = db_conn;
 
     let ctx_id = path.into_inner();
-    let deleted_row =
-        delete(dsl::contexts.filter(dsl::id.eq(&ctx_id))).execute(&mut conn);
-    match deleted_row {
-        Ok(0) => Err(not_found!("Context Id `{}` doesn't exists", ctx_id)),
-        Ok(_) => {
-            log::info!("{ctx_id} context deleted by {}", user.get_email());
-            Ok(HttpResponse::NoContent().finish())
+    let mut snowflake_generator = state.snowflake_generator.lock().unwrap();
+    let version_id = snowflake_generator.real_time_generate();
+    conn.transaction::<_, superposition::AppError, _>(|transaction_conn| {
+        let deleted_row =
+            delete(dsl::contexts.filter(dsl::id.eq(&ctx_id))).execute(transaction_conn);
+        match deleted_row {
+            Ok(0) => Err(not_found!("Context Id `{}` doesn't exists", ctx_id)),
+            Ok(_) => {
+                add_config_version(version_id, transaction_conn)?;
+                log::info!("{ctx_id} context deleted by {}", user.get_email());
+                Ok(HttpResponse::NoContent().finish())
+            }
+            Err(e) => {
+                log::error!("context delete query failed with error: {e}");
+                Err(unexpected_error!("Something went wrong."))
+            }
         }
-        Err(e) => {
-            log::error!("context delete query failed with error: {e}");
-            Err(unexpected_error!("Something went wrong."))
-        }
-    }
+    })
 }
 
 #[put("/bulk-operations")]
 async fn bulk_operations(
+    state: Data<AppState>,
     reqs: Json<Vec<ContextAction>>,
     db_conn: DbConnection,
     user: User,
 ) -> superposition::Result<Json<Vec<ContextBulkResponse>>> {
     use contexts::dsl::contexts;
     let DbConnection(mut conn) = db_conn;
+    let mut snowflake_generator = state.snowflake_generator.lock().unwrap();
+    let version_id = snowflake_generator.real_time_generate();
 
     let mut response = Vec::<ContextBulkResponse>::new();
     conn.transaction::<_, superposition::AppError, _>(|transaction_conn| {
         for action in reqs.into_inner().into_iter() {
             match action {
                 ContextAction::PUT(put_req) => {
-                    let put_resp = put(Json(put_req), transaction_conn, true, &user)
-                        .map_err(|err| {
+                    let put_resp =
+                        put(Json(put_req), transaction_conn, &user).map_err(|err| {
                             log::error!(
                                 "Failed at insert into contexts due to {:?}",
                                 err
@@ -507,7 +518,7 @@ async fn bulk_operations(
                 }
                 ContextAction::MOVE((old_ctx_id, move_req)) => {
                     let move_context_resp =
-                        r#move(old_ctx_id, Json(move_req), transaction_conn, true, &user)
+                        r#move(old_ctx_id, Json(move_req), transaction_conn, &user)
                             .map_err(|err| {
                                 log::error!(
                                     "Failed at moving context reponse due to {:?}",
@@ -519,6 +530,7 @@ async fn bulk_operations(
                 }
             }
         }
+        add_config_version(version_id, transaction_conn)?;
         Ok(()) // Commit the transaction
     })?;
     Ok(Json(response))

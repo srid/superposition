@@ -8,7 +8,7 @@ use crate::api::context::helpers::validate_value_with_function;
 use crate::{
     api::functions::helpers::get_published_function_code,
     db::{self, models::DefaultConfig, schema::default_configs::dsl::default_configs},
-    helpers::validate_jsonschema,
+    helpers::{add_config_version, validate_jsonschema},
 };
 use actix_web::{
     get, put,
@@ -16,6 +16,7 @@ use actix_web::{
     HttpResponse, Scope,
 };
 use chrono::Utc;
+use diesel::Connection;
 use diesel::{
     r2d2::{ConnectionManager, PooledConnection},
     ExpressionMethods, PgConnection, QueryDsl, RunQueryDsl,
@@ -139,25 +140,30 @@ async fn create(
             )?;
         }
     }
+    let mut snowflake_generator = state.snowflake_generator.lock().unwrap();
+    let version_id = snowflake_generator.real_time_generate();
+    conn.transaction::<_, superposition::AppError, _>(|transaction_conn| {
+        let upsert = diesel::insert_into(default_configs)
+            .values(&default_config)
+            .on_conflict(db::schema::default_configs::key)
+            .do_update()
+            .set(&default_config)
+            .execute(transaction_conn);
 
-    let upsert = diesel::insert_into(default_configs)
-        .values(&default_config)
-        .on_conflict(db::schema::default_configs::key)
-        .do_update()
-        .set(&default_config)
-        .execute(&mut conn);
-
-    match upsert {
-        Ok(_) => Ok(HttpResponse::Ok().json(json!({
-            "message": "DefaultConfig created/updated successfully."
-        }))),
-        Err(e) => {
-            log::info!("DefaultConfig creation failed with error: {e}");
-            Err(unexpected_error!(
-                "Something went wrong, failed to create DefaultConfig"
-            ))
-        }
-    }
+        let ok_resp = match upsert {
+            Ok(_) => Ok(HttpResponse::Ok().json(json!({
+                "message": "DefaultConfig created/updated successfully."
+            }))),
+            Err(e) => {
+                log::info!("DefaultConfig creation failed with error: {e}");
+                Err(unexpected_error!(
+                    "Something went wrong, failed to create DefaultConfig"
+                ))
+            }
+        }?;
+        add_config_version(version_id, transaction_conn)?;
+        Ok(ok_resp)
+    })
 }
 
 fn fetch_default_key(

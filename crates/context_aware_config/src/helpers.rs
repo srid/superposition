@@ -1,4 +1,13 @@
+use crate::{
+    api::config::handlers::generate_cac,
+    db::{models::ConfigVersion, schema::config_versions},
+};
 use actix_web::http::header::{HeaderMap, HeaderName, HeaderValue};
+use chrono::Utc;
+use diesel::{
+    r2d2::{ConnectionManager, PooledConnection},
+    PgConnection, RunQueryDsl,
+};
 use itertools::{self, Itertools};
 use jsonschema::{Draft, JSONSchema, ValidationError};
 use serde_json::{json, Value};
@@ -243,6 +252,24 @@ pub fn json_to_sorted_string(v: &Value) -> String {
             new_vec.join(",")
         }
     }
+}
+
+pub fn add_config_version(
+    version_id: i64,
+    db_conn: &mut PooledConnection<ConnectionManager<PgConnection>>,
+) -> superposition::Result<()> {
+    use config_versions::dsl::config_versions;
+    let config = generate_cac(db_conn)?;
+
+    let config_version = ConfigVersion {
+        id: version_id.to_string(),
+        config: json!(config),
+        created_at: Utc::now().naive_utc(),
+    };
+    diesel::insert_into(config_versions)
+        .values(&config_version)
+        .execute(db_conn)?;
+    Ok(())
 }
 
 // ************ Tests *************

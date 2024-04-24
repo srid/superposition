@@ -7,7 +7,8 @@ use super::helpers::{
 
 use super::types::Config;
 use crate::db::schema::{
-    contexts::dsl as ctxt, default_configs::dsl as def_conf, event_log::dsl as event_log,
+    config_versions::dsl as config_versions, contexts::dsl as ctxt,
+    default_configs::dsl as def_conf, event_log::dsl as event_log,
 };
 use actix_http::header::{HeaderName, HeaderValue};
 use actix_web::{get, web::Query, HttpRequest, HttpResponse, Scope};
@@ -98,13 +99,19 @@ fn is_not_modified(max_created_at: Option<NaiveDateTime>, req: &HttpRequest) -> 
     max_created_at.is_some() && parsed_max <= last_modified
 }
 
-async fn generate_cac(
+pub fn generate_cac(
     conn: &mut PooledConnection<ConnectionManager<PgConnection>>,
 ) -> superposition::Result<Config> {
     let contexts_vec = ctxt::contexts
-        .select((ctxt::id, ctxt::value, ctxt::override_id, ctxt::override_))
+        .select((
+            ctxt::id,
+            ctxt::value,
+            ctxt::priority,
+            ctxt::override_id,
+            ctxt::override_,
+        ))
         .order_by((ctxt::priority.asc(), ctxt::created_at.asc()))
-        .load::<(String, Value, String, Value)>(conn)
+        .load::<(String, Value, i32, String, Value)>(conn)
         .map_err(|err| {
             log::error!("failed to fetch contexts with error: {}", err);
             db_error!(err)
@@ -112,10 +119,12 @@ async fn generate_cac(
 
     let (contexts, overrides) = contexts_vec.into_iter().fold(
         (Vec::new(), Map::new()),
-        |(mut ctxts, mut overrides), (id, condition, override_id, override_)| {
+        |(mut ctxts, mut overrides),
+         (id, condition, priority_, override_id, override_)| {
             let ctxt = super::types::Context {
                 id,
                 condition,
+                priority: priority_,
                 override_with_keys: [override_id.to_owned()],
             };
             ctxts.push(ctxt);
@@ -152,6 +161,8 @@ async fn get(
     req: HttpRequest,
     db_conn: DbConnection,
 ) -> superposition::Result<HttpResponse> {
+    // let DbConnection(mut conn) = db_conn;
+    // let mut conn: PooledConnection<ConnectionManager<PgConnection>> = db_conn;
     let DbConnection(mut conn) = db_conn;
 
     let max_created_at = get_max_created_at(&mut conn)
@@ -182,7 +193,31 @@ async fn get(
         );
     }
 
-    let mut config = generate_cac(&mut conn).await?;
+    let mut config_version = json!({});
+    if let Some(Value::String(version_id)) = query_params_map.get("version") {
+        config_version = config_versions::config_versions
+            .select(config_versions::config)
+            .filter(config_versions::id.eq(version_id))
+            .get_result::<Value>(&mut conn)
+            .map_err(|err| {
+                log::error!("failed to fetch config with error: {}", err);
+                db_error!(err)
+            })?;
+    } else {
+        config_version = config_versions::config_versions
+            .select(config_versions::config)
+            .order_by(config_versions::created_at.desc())
+            .first::<Value>(&mut conn)
+            .map_err(|err| {
+                log::error!("failed to fetch config with error: {}", err);
+                db_error!(err)
+            })?;
+    };
+    let mut config = serde_json::from_value::<Config>(config_version).map_err(|err| {
+        log::error!("failed to decode config: {}", err);
+        unexpected_error!("failed to decode config")
+    })?;
+    query_params_map.remove("version");
     if let Some(prefix) = query_params_map.get("prefix") {
         let prefix_list: HashSet<&str> = prefix
             .as_str()
@@ -240,7 +275,7 @@ async fn get_resolved_config(
         return Ok(HttpResponse::NotModified().finish());
     }
 
-    let res = generate_cac(&mut conn).await?;
+    let res = generate_cac(&mut conn)?;
 
     let cac_client_contexts = res
         .contexts
@@ -313,7 +348,7 @@ async fn get_filtered_config(
                 .map_or_else(|_| json!(value), |int_val| json!(int_val)),
         );
     }
-    let config = generate_cac(&mut conn).await?;
+    let config = generate_cac(&mut conn)?;
     let contexts = config.contexts;
 
     let filtered_context = filter_context(&contexts, &query_params_map)?;

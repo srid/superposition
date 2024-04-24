@@ -601,6 +601,14 @@ diesel::table! {
 diesel::joinable!(default_configs -> functions (function_name));
 diesel::joinable!(dimensions -> functions (function_name));
 
+diesel::table! {
+    config_versions (id) {
+        id -> Text,
+        config -> Json,
+        created_at -> Timestamp,
+    }
+}
+
 diesel::allow_tables_to_appear_in_same_query!(
     contexts,
     default_configs,
@@ -648,4 +656,5 @@ diesel::allow_tables_to_appear_in_same_query!(
     event_log_y2026m11,
     event_log_y2026m12,
     functions,
+    config_versions,
 );
