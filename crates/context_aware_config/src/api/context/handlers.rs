@@ -1,7 +1,9 @@
 extern crate base64;
 use std::str;
 
-use crate::helpers::{json_to_sorted_string, validate_context_jsonschema};
+use crate::helpers::{
+    calculate_context_priority, json_to_sorted_string, validate_context_jsonschema,
+};
 use crate::{
     api::{
         context::types::{
@@ -28,6 +30,7 @@ use diesel::{
     delete,
     r2d2::{ConnectionManager, PooledConnection},
     result::{DatabaseErrorKind::*, Error::DatabaseError},
+    upsert::excluded,
     Connection, ExpressionMethods, PgConnection, QueryDsl, RunQueryDsl,
 };
 use jsonschema::{Draft, JSONSchema, ValidationError};
@@ -51,6 +54,7 @@ pub fn endpoints() -> Scope {
         .service(bulk_operations)
         .service(list_contexts)
         .service(get_context)
+        .service(priority_recompute)
 }
 
 type DBConnection = PooledConnection<ConnectionManager<PgConnection>>;
@@ -522,4 +526,49 @@ async fn bulk_operations(
         Ok(()) // Commit the transaction
     })?;
     Ok(Json(response))
+}
+
+#[put("/priority/recompute")]
+async fn priority_recompute(
+    db_conn: DbConnection,
+    _user: User,
+) -> superposition::Result<HttpResponse> {
+    use crate::db::schema::contexts::dsl::*;
+    let DbConnection(mut conn) = db_conn;
+
+    let result: Vec<Context> = contexts.load(&mut conn).map_err(|err| {
+        log::error!("failed to fetch contexts with error: {}", err);
+        db_error!(err)
+    })?;
+
+    let dimension_schema_map = get_all_dimension_schema_map(&mut conn)?;
+    let update_contexts: Vec<Context> = result
+        .iter()
+        .map(|context| Context {
+            priority: calculate_context_priority(
+                "context",
+                &context.value,
+                &dimension_schema_map,
+            )
+            .unwrap(),
+            ..context.clone()
+        })
+        .collect::<Vec<Context>>();
+    let insert = diesel::insert_into(contexts)
+        .values(&update_contexts)
+        .on_conflict(id)
+        .do_update()
+        .set(priority.eq(excluded(priority)))
+        .execute(&mut conn);
+
+    match insert {
+        Ok(_) => Ok(HttpResponse::Ok()
+            .json(json!({"message": "Contexts priority updated successfully"}))),
+        Err(err) => {
+            log::error!(
+                "Failed to execute query while recomputing priority, error: {err}"
+            );
+            Err(db_error!(err))
+        }
+    }
 }
