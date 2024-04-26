@@ -1,6 +1,11 @@
 extern crate base64;
-use super::types::CreateReq;
-use service_utils::{bad_argument, unexpected_error, validation_error};
+use super::types::{CreateQParams, CreateReq};
+use service_utils::{
+    bad_argument,
+    result as superposition,
+    service::types::{AppState, ConfigVersionType, DbConnection},
+    unexpected_error, validation_error,
+};
 
 use superposition_types::{SuperpositionUser, User};
 
@@ -23,10 +28,6 @@ use diesel::{
 };
 use jsonschema::{Draft, JSONSchema, ValidationError};
 use serde_json::{json, Value};
-use service_utils::{
-    result as superposition,
-    service::types::{AppState, DbConnection},
-};
 
 pub fn endpoints() -> Scope {
     Scope::new("").service(create).service(get)
@@ -37,12 +38,17 @@ async fn create(
     state: Data<AppState>,
     key: web::Path<String>,
     request: web::Json<CreateReq>,
+    qparams: web::Query<CreateQParams>,
     db_conn: DbConnection,
     user: User,
 ) -> superposition::Result<HttpResponse> {
     let DbConnection(mut conn) = db_conn;
     let req = request.into_inner();
     let key = key.into_inner();
+    let version_type = qparams
+        .update_type
+        .map_or(ConfigVersionType::STABLE, |v| v)
+        .to_string();
 
     if req.value.is_none() && req.schema.is_none() && req.function_name.is_none() {
         log::error!("No data provided in the request body for {key}");
@@ -140,8 +146,6 @@ async fn create(
             )?;
         }
     }
-    let mut snowflake_generator = state.snowflake_generator.lock().unwrap();
-    let version_id = snowflake_generator.real_time_generate();
     conn.transaction::<_, superposition::AppError, _>(|transaction_conn| {
         let upsert = diesel::insert_into(default_configs)
             .values(&default_config)
@@ -161,7 +165,7 @@ async fn create(
                 ))
             }
         }?;
-        add_config_version(version_id, transaction_conn)?;
+        add_config_version(&state, version_type, transaction_conn)?;
         Ok(ok_resp)
     })
 }

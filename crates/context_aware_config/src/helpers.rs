@@ -11,8 +11,9 @@ use diesel::{
 use itertools::{self, Itertools};
 use jsonschema::{Draft, JSONSchema, ValidationError};
 use serde_json::{json, Value};
-use service_utils::{result as superposition, validation_error};
+use service_utils::{result as superposition, validation_error, service::types::AppState,  helpers::generate_snowflake_id};
 use std::collections::HashMap;
+use actix_web::web::Data;
 
 pub fn get_default_config_validation_schema() -> JSONSchema {
     let my_schema = json!(
@@ -255,21 +256,26 @@ pub fn json_to_sorted_string(v: &Value) -> String {
 }
 
 pub fn add_config_version(
-    version_id: i64,
+    state: &Data<AppState>,
+    version_type: String,
     db_conn: &mut PooledConnection<ConnectionManager<PgConnection>>,
-) -> superposition::Result<()> {
+) -> superposition::Result<i64> {
     use config_versions::dsl::config_versions;
+    let version_id = generate_snowflake_id(state)?;
     let config = generate_cac(db_conn)?;
-
+    let json_config = json!(config);
+    let config_hash = blake3::hash(json_config.to_string().as_bytes()).to_string();
     let config_version = ConfigVersion {
-        id: version_id.to_string(),
-        config: json!(config),
+        id: version_id,
+        config: json_config,
+        config_hash,
+        version_type: version_type,
         created_at: Utc::now().naive_utc(),
     };
     diesel::insert_into(config_versions)
         .values(&config_version)
         .execute(db_conn)?;
-    Ok(())
+    Ok(version_id)
 }
 
 // ************ Tests *************

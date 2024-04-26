@@ -1,4 +1,5 @@
-use actix_web::{error::ErrorInternalServerError, Error};
+use actix_web::{error::ErrorInternalServerError, web::Data, Error};
+use anyhow::anyhow;
 use log::info;
 use serde::de::{self, IntoDeserializer};
 use std::{
@@ -8,6 +9,7 @@ use std::{
 };
 
 use super::result;
+use crate::service::types::AppState;
 use serde_json::{Map, Value};
 
 //WARN Do NOT use this fxn inside api requests, instead add the required
@@ -197,4 +199,15 @@ pub fn get_variable_name_and_value(
             ))?;
 
     Ok((variable_name, variable_value))
+}
+
+pub fn generate_snowflake_id(state: &Data<AppState>) -> result::Result<i64> {
+    let mut snowflake_generator = state.snowflake_generator.lock().map_err(|e| {
+        log::error!("snowflake_id generation failed {}", e);
+        result::AppError::UnexpectedError(anyhow!("snowflake_id generation failed {}", e))
+    })?;
+    let id = snowflake_generator.real_time_generate();
+    // explicitly dropping snowflake_generator so that lock is released and it can be acquired in bulk-operations handler
+    drop(snowflake_generator);
+    Ok(id)
 }

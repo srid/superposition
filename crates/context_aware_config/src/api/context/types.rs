@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use service_utils::service::types::ConfigVersionType;
 
 #[derive(Deserialize, Clone)]
 pub struct PutReq {
@@ -48,4 +49,24 @@ pub enum ContextBulkResponse {
 pub struct FunctionsInfo {
     pub name: String,
     pub code: Option<String>,
+}
+
+#[derive(Deserialize, Clone)]
+pub struct MoveQParams {
+    pub update_type: Option<ConfigVersionType>,
+}
+
+#[derive(Deserialize, Clone)]
+pub struct BulkOperationQParams {
+    pub update_type: Option<ConfigVersionType>,
+}
+
+#[derive(Deserialize, Clone)]
+pub struct PutQParams {
+    pub update_type: Option<ConfigVersionType>,
+}
+
+#[derive(Deserialize, Clone)]
+pub struct DeleteQParams {
+    pub update_type: Option<ConfigVersionType>,
 }

@@ -603,8 +603,10 @@ diesel::joinable!(dimensions -> functions (function_name));
 
 diesel::table! {
     config_versions (id) {
-        id -> Text,
+        id -> Int8,
         config -> Json,
+        config_hash -> Text,
+        version_type -> Text,
         created_at -> Timestamp,
     }
 }

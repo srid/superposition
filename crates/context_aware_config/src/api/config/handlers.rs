@@ -19,11 +19,9 @@ use diesel::{
     r2d2::{ConnectionManager, PooledConnection},
     ExpressionMethods, PgConnection, QueryDsl, RunQueryDsl,
 };
-use serde_json::{json, Map, Value};
-use service_utils::service::types::DbConnection;
-use service_utils::{bad_argument, db_error, unexpected_error};
+use serde_json::{from_value, json, Map, Value};
+use service_utils::{result as superposition, bad_argument, db_error, unexpected_error, service::types::{DbConnection, ConfigVersionType}};
 
-use service_utils::result as superposition;
 use uuid::Uuid;
 
 pub fn endpoints() -> Scope {
@@ -99,6 +97,41 @@ fn is_not_modified(max_created_at: Option<NaiveDateTime>, req: &HttpRequest) -> 
     max_created_at.is_some() && parsed_max <= last_modified
 }
 
+pub fn generate_config_from_version(
+    version: Option<Value>,
+    conn: &mut PooledConnection<ConnectionManager<PgConnection>>,
+) -> superposition::Result<Config> {
+    let config_version = match version {
+        None => config_versions::config_versions
+            .select(config_versions::config)
+            .filter(config_versions::version_type.eq(ConfigVersionType::STABLE.to_string()))
+            .order_by(config_versions::created_at.desc())
+            .first::<Value>(conn)
+            .map_err(|err| {
+                log::error!("failed to fetch config with error: {}", err);
+                db_error!(err)
+            }),
+        Some(version_val) => {
+            let version_id = from_value::<i64>(version_val).map_err(|e| {
+                log::error!("failed to decode version_id as integer: {}", e);
+                bad_argument!("version_id is not of type integer")
+            })?;
+            config_versions::config_versions
+                .select(config_versions::config)
+                .filter(config_versions::id.eq(version_id))
+                .get_result::<Value>(conn)
+                .map_err(|err| {
+                    log::error!("failed to fetch config with error: {}", err);
+                    db_error!(err)
+                })
+        }
+    }?;
+
+    serde_json::from_value::<Config>(config_version).map_err(|err| {
+        log::error!("failed to decode config: {}", err);
+        unexpected_error!("failed to decode config")
+    })
+}
 pub fn generate_cac(
     conn: &mut PooledConnection<ConnectionManager<PgConnection>>,
 ) -> superposition::Result<Config> {
@@ -161,8 +194,6 @@ async fn get(
     req: HttpRequest,
     db_conn: DbConnection,
 ) -> superposition::Result<HttpResponse> {
-    // let DbConnection(mut conn) = db_conn;
-    // let mut conn: PooledConnection<ConnectionManager<PgConnection>> = db_conn;
     let DbConnection(mut conn) = db_conn;
 
     let max_created_at = get_max_created_at(&mut conn)
@@ -188,36 +219,13 @@ async fn get(
         query_params_map.insert(
             key,
             value
-                .parse::<i32>()
+                .parse::<i64>()
                 .map_or_else(|_| json!(value), |int_val| json!(int_val)),
         );
     }
 
-    let mut config_version = json!({});
-    if let Some(Value::String(version_id)) = query_params_map.get("version") {
-        config_version = config_versions::config_versions
-            .select(config_versions::config)
-            .filter(config_versions::id.eq(version_id))
-            .get_result::<Value>(&mut conn)
-            .map_err(|err| {
-                log::error!("failed to fetch config with error: {}", err);
-                db_error!(err)
-            })?;
-    } else {
-        config_version = config_versions::config_versions
-            .select(config_versions::config)
-            .order_by(config_versions::created_at.desc())
-            .first::<Value>(&mut conn)
-            .map_err(|err| {
-                log::error!("failed to fetch config with error: {}", err);
-                db_error!(err)
-            })?;
-    };
-    let mut config = serde_json::from_value::<Config>(config_version).map_err(|err| {
-        log::error!("failed to decode config: {}", err);
-        unexpected_error!("failed to decode config")
-    })?;
-    query_params_map.remove("version");
+    let mut config =
+        generate_config_from_version(query_params_map.remove("version"), &mut conn)?;
     if let Some(prefix) = query_params_map.get("prefix") {
         let prefix_list: HashSet<&str> = prefix
             .as_str()
@@ -260,7 +268,7 @@ async fn get_resolved_config(
         query_params_map.insert(
             item.0,
             item.1
-                .parse::<i32>()
+                .parse::<i64>()
                 .map_or_else(|_| json!(item.1), |int_val| json!(int_val)),
         );
     }
@@ -275,7 +283,8 @@ async fn get_resolved_config(
         return Ok(HttpResponse::NotModified().finish());
     }
 
-    let res = generate_cac(&mut conn)?;
+    let res =
+        generate_config_from_version(query_params_map.remove("version"), &mut conn)?;
 
     let cac_client_contexts = res
         .contexts
@@ -344,11 +353,12 @@ async fn get_filtered_config(
         query_params_map.insert(
             key,
             value
-                .parse::<i32>()
+                .parse::<i64>()
                 .map_or_else(|_| json!(value), |int_val| json!(int_val)),
         );
     }
-    let config = generate_cac(&mut conn)?;
+    let config =
+        generate_config_from_version(query_params_map.remove("version"), &mut conn)?;
     let contexts = config.contexts;
 
     let filtered_context = filter_context(&contexts, &query_params_map)?;

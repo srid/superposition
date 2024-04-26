@@ -81,7 +81,9 @@ pub struct EventLog {
 #[diesel(check_for_backend(diesel::pg::Pg))]
 #[diesel(primary_key(id))]
 pub struct ConfigVersion {
-    pub id: String,
+    pub id: i64,
     pub config: Value,
+    pub config_hash: String,
+    pub version_type: String,
     pub created_at: NaiveDateTime,
 }

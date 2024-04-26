@@ -1,5 +1,6 @@
 use serde::{Deserialize, Deserializer};
 use serde_json::{Map, Value};
+use service_utils::service::types::ConfigVersionType;
 
 #[derive(Debug, Deserialize)]
 pub struct CreateReq {
@@ -16,4 +17,9 @@ where
 {
     let value: Value = Deserialize::deserialize(deserializer)?;
     Ok(Some(value))
+}
+
+#[derive(Deserialize, Clone)]
+pub struct CreateQParams {
+    pub update_type: Option<ConfigVersionType>,
 }

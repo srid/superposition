@@ -7,8 +7,9 @@ use crate::helpers::{
 use crate::{
     api::{
         context::types::{
-            ContextAction, ContextBulkResponse, DimensionCondition, MoveReq,
-            PaginationParams, PutReq, PutResp,
+            BulkOperationQParams, ContextAction, ContextBulkResponse, DeleteQParams,
+            DimensionCondition, MoveQParams, MoveReq, PaginationParams, PutQParams,
+            PutReq, PutResp,
         },
         dimension::get_all_dimension_schema_map,
     },
@@ -21,7 +22,9 @@ use crate::{
     },
 };
 use actix_web::web::Data;
-use service_utils::service::types::AppState;
+use service_utils::{
+    service::types::{AppState, ConfigVersionType},
+};
 
 use actix_web::{
     delete, get, put,
@@ -281,11 +284,14 @@ fn put(
 async fn put_handler(
     state: Data<AppState>,
     req: Json<PutReq>,
+    qparams: Query<PutQParams>,
     mut db_conn: DbConnection,
     user: User,
 ) -> superposition::Result<Json<PutResp>> {
-    let mut snowflake_generator = state.snowflake_generator.lock().unwrap();
-    let version_id = snowflake_generator.real_time_generate();
+    let version_type = qparams
+        .update_type
+        .map_or(ConfigVersionType::STABLE, |v| v)
+        .to_string();
     db_conn.transaction::<_, superposition::AppError, _>(|transaction_conn| {
         let put_response = put(req, transaction_conn, &user)
             .map(|resp| Json(resp))
@@ -293,7 +299,7 @@ async fn put_handler(
                 log::info!("context put failed with error: {:?}", err);
                 err
             })?;
-        add_config_version(version_id, transaction_conn)?;
+        add_config_version(&state, version_type, transaction_conn)?;
         Ok(put_response)
     })
 }
@@ -368,11 +374,14 @@ async fn move_handler(
     state: Data<AppState>,
     path: Path<String>,
     req: Json<MoveReq>,
+    qparams: Query<MoveQParams>,
     mut db_conn: DbConnection,
     user: User,
 ) -> superposition::Result<Json<PutResp>> {
-    let mut snowflake_generator = state.snowflake_generator.lock().unwrap();
-    let version_id = snowflake_generator.real_time_generate();
+    let version_type = qparams
+        .update_type
+        .map_or(ConfigVersionType::STABLE, |v| v)
+        .to_string();
     db_conn.transaction::<_, superposition::AppError, _>(|transaction_conn| {
         let move_reponse = r#move(path.into_inner(), req, transaction_conn, &user)
             .map(|resp| Json(resp))
@@ -380,7 +389,7 @@ async fn move_handler(
                 log::info!("move api failed with error: {:?}", err);
                 err
             })?;
-        add_config_version(version_id, transaction_conn)?;
+        add_config_version(&state, version_type, transaction_conn)?;
         Ok(move_reponse)
     })
 }
@@ -438,6 +447,7 @@ async fn list_contexts(
 async fn delete_context(
     state: Data<AppState>,
     path: Path<String>,
+    qparams: Query<DeleteQParams>,
     db_conn: DbConnection,
     user: User,
 ) -> superposition::Result<HttpResponse> {
@@ -445,15 +455,17 @@ async fn delete_context(
     let DbConnection(mut conn) = db_conn;
 
     let ctx_id = path.into_inner();
-    let mut snowflake_generator = state.snowflake_generator.lock().unwrap();
-    let version_id = snowflake_generator.real_time_generate();
+    let version_type = qparams
+        .update_type
+        .map_or(ConfigVersionType::STABLE, |v| v)
+        .to_string();
     conn.transaction::<_, superposition::AppError, _>(|transaction_conn| {
         let deleted_row =
             delete(dsl::contexts.filter(dsl::id.eq(&ctx_id))).execute(transaction_conn);
         match deleted_row {
             Ok(0) => Err(not_found!("Context Id `{}` doesn't exists", ctx_id)),
             Ok(_) => {
-                add_config_version(version_id, transaction_conn)?;
+                add_config_version(&state, version_type, transaction_conn)?;
                 log::info!("{ctx_id} context deleted by {}", user.get_email());
                 Ok(HttpResponse::NoContent().finish())
             }
@@ -469,13 +481,16 @@ async fn delete_context(
 async fn bulk_operations(
     state: Data<AppState>,
     reqs: Json<Vec<ContextAction>>,
+    qparams: Query<BulkOperationQParams>,
     db_conn: DbConnection,
     user: User,
 ) -> superposition::Result<Json<Vec<ContextBulkResponse>>> {
     use contexts::dsl::contexts;
     let DbConnection(mut conn) = db_conn;
-    let mut snowflake_generator = state.snowflake_generator.lock().unwrap();
-    let version_id = snowflake_generator.real_time_generate();
+    let version_type = qparams
+        .update_type
+        .map_or(ConfigVersionType::STABLE, |v| v)
+        .to_string();
 
     let mut response = Vec::<ContextBulkResponse>::new();
     conn.transaction::<_, superposition::AppError, _>(|transaction_conn| {
@@ -530,7 +545,7 @@ async fn bulk_operations(
                 }
             }
         }
-        add_config_version(version_id, transaction_conn)?;
+        add_config_version(&state, version_type, transaction_conn)?;
         Ok(()) // Commit the transaction
     })?;
     Ok(Json(response))

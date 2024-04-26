@@ -1,6 +1,7 @@
 use crate::db::pgschema_manager::{PgSchemaConnection, PgSchemaManager};
 use derive_more::{Deref, DerefMut};
 use jsonschema::JSONSchema;
+use serde::Deserialize;
 use serde_json::json;
 
 use std::{
@@ -208,4 +209,10 @@ impl FromRequest for DbConnection {
 
         ready(result)
     }
+}
+
+#[derive(Copy, Clone, Debug, Deserialize, strum_macros::Display)]
+pub enum ConfigVersionType {
+    STABLE,
+    NOISY,
 }
