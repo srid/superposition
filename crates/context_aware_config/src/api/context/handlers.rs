@@ -51,10 +51,10 @@ use service_utils::{bad_argument, result as superposition};
 pub fn endpoints() -> Scope {
     Scope::new("")
         .service(put_handler)
-        .service(move_handler)
-        .service(delete_context)
         .service(bulk_operations)
         .service(list_contexts)
+        .service(move_handler)
+        .service(delete_context)
         .service(get_context)
 }
 

@@ -7,6 +7,7 @@ use std::{
     collections::HashSet,
     future::{ready, Ready},
     str::FromStr,
+    sync::Arc,
 };
 
 use actix_web::{error, web::Data, Error, FromRequest, HttpMessage};
@@ -37,7 +38,7 @@ pub struct AppState {
     pub default_config_validation_schema: JSONSchema,
     pub meta_schema: JSONSchema,
     pub experimentation_flags: ExperimentationFlags,
-    pub snowflake_generator: Mutex<SnowflakeIdGenerator>,
+    pub snowflake_generator: Arc<Mutex<SnowflakeIdGenerator>>,
     pub enable_tenant_and_scope: bool,
     pub tenant_middleware_exclusion_list: HashSet<String>,
     pub service_prefix: String,

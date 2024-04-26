@@ -161,6 +161,8 @@ async fn create(
     // generating snowflake id for experiment
     let mut snowflake_generator = state.snowflake_generator.lock().unwrap();
     let experiment_id = snowflake_generator.real_time_generate();
+    // explicitly dropping snowflake_generator so that lock is released and it can be acquired in bulk-operations handler
+    drop(snowflake_generator);
 
     //create overrides in CAC, if successfull then create experiment in DB
     let mut cac_operations: Vec<ContextAction> = vec![];
